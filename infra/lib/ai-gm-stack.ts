@@ -12,12 +12,13 @@ export class AiGmSleeperStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const username = (this.node.tryGetContext('username') as string) || 'YOUR_SLEEPER_USERNAME';
-    const season = Number(this.node.tryGetContext('season') ?? 2025);
+    // Optional context for scheduled roster syncs; functions can be invoked with parameters for any user/league
+    const username = this.node.tryGetContext('username') as string | undefined;
+    const season = Number(this.node.tryGetContext('season') ?? new Date().getFullYear());
     const leagueId = (this.node.tryGetContext('leagueId') as string) || undefined;
     const rosterEvery = Number(this.node.tryGetContext('rosterEvery') ?? 10);
     const playersPrefix = (this.node.tryGetContext('playersPrefix') as string) || 'sleeper/players';
-    const rosterPrefix = (this.node.tryGetContext('rosterPrefix') as string) || 'sleeper_sync';
+    const rosterPrefix = (this.node.tryGetContext('rosterPrefix') as string) || 'sleeper/rosters';
 
     const bucket = new s3.Bucket(this, 'SleeperDataBucket', {
       versioned: true,
@@ -35,6 +36,7 @@ export class AiGmSleeperStack extends cdk.Stack {
       PLAYERS_S3_PREFIX: playersPrefix,
       ROSTER_S3_PREFIX: rosterPrefix,
       PLAYERS_CACHE_PATH: "/tmp/players_nfl.json",
+      ROSTER_TARGETS_KEY: "sleeper/config/roster_targets.json",
     };
 
     const playersFn = new PythonFunction(this, 'PlayersSyncFn', {
@@ -64,6 +66,20 @@ export class AiGmSleeperStack extends cdk.Stack {
     bucket.grantReadWrite(playersFn);
     bucket.grantReadWrite(rosterFn);
 
+    // Orchestrator function to read S3 targets list and invoke roster syncs hourly
+    const rosterOrchestratorFn = new PythonFunction(this, 'RosterOrchestratorFn', {
+      entry: lambdaCodePath,
+      index: 'sleeper_sync.py',
+      handler: 'roster_scheduler_handler',
+      runtime: Runtime.PYTHON_3_12,
+      architecture: Architecture.ARM_64,
+      memorySize: 512,
+      timeout: cdk.Duration.seconds(240),
+      environment: { ...baseEnv, USE_S3_PLAYERS: '1' },
+      logRetention: logs.RetentionDays.ONE_WEEK,
+    });
+    bucket.grantReadWrite(rosterOrchestratorFn);
+
     const playersTargetRole = new iam.Role(this, 'PlayersSchedulerRole', {
       assumedBy: new iam.ServicePrincipal('scheduler.amazonaws.com'),
     });
@@ -82,15 +98,31 @@ export class AiGmSleeperStack extends cdk.Stack {
     });
     rosterFn.grantInvoke(rosterTargetRole);
 
-    new scheduler.CfnSchedule(this, 'RosterEveryNMinutes', {
+    // Create the roster schedule only if a username is provided; otherwise, invoke the function on-demand with parameters.
+    if (username) {
+      new scheduler.CfnSchedule(this, 'RosterEveryNMinutes', {
+        flexibleTimeWindow: { mode: 'OFF' },
+        scheduleExpression: `rate(${rosterEvery} minutes)`,
+        target: { arn: rosterFn.functionArn, roleArn: rosterTargetRole.roleArn, input: JSON.stringify({ username, season, league_id: leagueId }) },
+        description: `Roster sync every ${rosterEvery} minutes`,
+      });
+    }
+
+    // Hourly schedule that drives orchestrator across all configured targets
+    const rosterBatchRole = new iam.Role(this, 'RosterBatchSchedulerRole', {
+      assumedBy: new iam.ServicePrincipal('scheduler.amazonaws.com'),
+    });
+    rosterOrchestratorFn.grantInvoke(rosterBatchRole);
+    new scheduler.CfnSchedule(this, 'RosterHourlySchedule', {
       flexibleTimeWindow: { mode: 'OFF' },
-      scheduleExpression: `rate(${rosterEvery} minutes)`,
-      target: { arn: rosterFn.functionArn, roleArn: rosterTargetRole.roleArn, input: JSON.stringify({ username, season, league_id: leagueId }) },
-      description: `Roster sync every ${rosterEvery} minutes`,
+      scheduleExpression: 'cron(0 * * * ? *)',
+      target: { arn: rosterOrchestratorFn.functionArn, roleArn: rosterBatchRole.roleArn, input: JSON.stringify({}) },
+      description: 'Hourly roster sync for configured targets',
     });
 
     new cdk.CfnOutput(this, 'BucketName', { value: bucket.bucketName });
     new cdk.CfnOutput(this, 'PlayersFnName', { value: playersFn.functionName });
     new cdk.CfnOutput(this, 'RosterFnName', { value: rosterFn.functionName });
+    new cdk.CfnOutput(this, 'RosterOrchestratorFnName', { value: rosterOrchestratorFn.functionName });
   }
 }

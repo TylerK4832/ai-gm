@@ -1,0 +1,22 @@
+# Node & CDK build artifacts
+node_modules/
+cdk.out/
+dist/
+build/
+
+# Local caches
+.players_nfl.json
+.cache/
+
+# OS/editor noise
+.DS_Store
+*.log
+*.swp
+*.swo
+
+# Misc generated outputs
+out.json
+coverage/
+.pytest_cache/
+.venv/
+
