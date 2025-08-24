@@ -1,0 +1,51 @@
+{
+  "version": "48.0.0",
+  "files": {
+    "01d908f7f0710252d9764c1d843c532e850c0caf918b0cd99e5315576f0e1e13": {
+      "displayName": "PlayersSyncFn/Code",
+      "source": {
+        "path": "asset.01d908f7f0710252d9764c1d843c532e850c0caf918b0cd99e5315576f0e1e13",
+        "packaging": "zip"
+      },
+      "destinations": {
+        "484908222088-us-east-2-8430f6b1": {
+          "bucketName": "cdk-hnb659fds-assets-484908222088-us-east-2",
+          "objectKey": "01d908f7f0710252d9764c1d843c532e850c0caf918b0cd99e5315576f0e1e13.zip",
+          "region": "us-east-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::484908222088:role/cdk-hnb659fds-file-publishing-role-484908222088-us-east-2"
+        }
+      }
+    },
+    "2819175352ad1ce0dae768e83fc328fb70fb5f10b4a8ff0ccbcb791f02b0716d": {
+      "displayName": "LogRetentionaae0aa3c5b4d4f87b02d85b201efdd8a/Code",
+      "source": {
+        "path": "asset.2819175352ad1ce0dae768e83fc328fb70fb5f10b4a8ff0ccbcb791f02b0716d",
+        "packaging": "zip"
+      },
+      "destinations": {
+        "484908222088-us-east-2-5408f54a": {
+          "bucketName": "cdk-hnb659fds-assets-484908222088-us-east-2",
+          "objectKey": "2819175352ad1ce0dae768e83fc328fb70fb5f10b4a8ff0ccbcb791f02b0716d.zip",
+          "region": "us-east-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::484908222088:role/cdk-hnb659fds-file-publishing-role-484908222088-us-east-2"
+        }
+      }
+    },
+    "6c1c02c88e0a66dbaab5447e23d31b69f4d6bf87bcb1aff118d362c8414e0123": {
+      "displayName": "AiGmSleeperStack Template",
+      "source": {
+        "path": "AiGmSleeperStack.template.json",
+        "packaging": "file"
+      },
+      "destinations": {
+        "484908222088-us-east-2-d8f92e57": {
+          "bucketName": "cdk-hnb659fds-assets-484908222088-us-east-2",
+          "objectKey": "6c1c02c88e0a66dbaab5447e23d31b69f4d6bf87bcb1aff118d362c8414e0123.json",
+          "region": "us-east-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::484908222088:role/cdk-hnb659fds-file-publishing-role-484908222088-us-east-2"
+        }
+      }
+    }
+  },
+  "dockerImages": {}
+}

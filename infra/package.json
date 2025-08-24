@@ -1,0 +1,14 @@
+{
+  "name": "ai-gm-sleeper-infra",
+  "version": "0.1.0",
+  "bin": { "cdk": "cdk.js" },
+  "devDependencies": {
+    "aws-cdk-lib": "^2.149.0",
+    "constructs": "^10.3.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@aws-cdk/aws-lambda-python-alpha": "^2.149.0-alpha.0"
+  }
+}

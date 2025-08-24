@@ -1,49 +1,58 @@
 #!/usr/bin/env python3
 """
-Sleeper League & Roster Sync (Python MVP)
+Sleeper League & Roster Sync (Python, decoupled flows)
 
-What this does
-- Look up a Sleeper user by username
-- List their NFL leagues for a given season
-- Fetch users and rosters for a league
-- Join rosters with managers & expand player_ids to names/pos/team via players map
-- Output JSON to stdout and (optionally) save to a local file or S3
+This file now supports **two independent syncs** so player-syncs can run at most once per day,
+while roster-syncs can run many times per day without re-downloading the giant players map.
 
-Usage (local):
-  pip install httpx boto3 python-dateutil
-  python sleeper_sync.py --username YOUR_SLEEPER_USERNAME --season 2025 --league-id <optional>
+Subcommands / Lambda handlers
+- CLI subcommands:
+    - `players-sync` : fetch `/players/nfl` once and publish to S3 (dated + current) and/or local file
+    - `roster-sync`  : fetch league rosters and expand using players **from S3 current** (fallback: local cache or live)
+- Lambda handlers:
+    - `players_lambda_handler(event, context)`
+    - `roster_lambda_handler(event, context)`
 
-Optional env vars:
-  S3_BUCKET            -> if set, uploads the JSON snapshot to s3://$S3_BUCKET/sleeper_sync/<league_id>.json
-  AWS_REGION           -> AWS region for S3 client (default "us-east-1")
-  PLAYERS_CACHE_PATH   -> local cache path for players map (default ".players_nfl.json")
-  PLAYERS_CACHE_TTL_HR -> hours to reuse cached players map (default 24)
+S3 layout (recommended)
+  s3://$S3_BUCKET/$PLAYERS_S3_PREFIX/
+    ├── YYYY-MM-DD.json        # full snapshot, immutable per day
+    ├── current.json           # overwritten pointer to latest full snapshot
+    └── players_core.json      # trimmed map {id: {full_name, position, team, bye_week, status, injury_status}}
 
-Lambda use:
-  - Package this file with its deps as a Lambda. Set S3_BUCKET to write snapshots to S3 on a schedule.
-  - Handler: lambda_handler(event, context) with keys {"username":"...","season":2025,"league_id":"..."}
+ENV VARS
+  S3_BUCKET=...               # enable S3 writes/reads
+  AWS_REGION=us-east-1        # optional
+  PLAYERS_S3_PREFIX=sleeper/players
+  PLAYERS_CACHE_PATH=.players_nfl.json
+  PLAYERS_CACHE_TTL_HR=24
+  ROSTER_S3_PREFIX=sleeper_sync   # where roster snapshots go (league_id.json)
+  USE_S3_PLAYERS=1             # roster-sync prefers S3 players current.json (decoupling)
 
-Notes:
-  - Uses public Sleeper API; be polite with rate limits.
-  - Players map is large; we cache it locally/S3 to avoid repeated downloads.
+Usage examples
+  # Daily players sync (writes to S3 and updates current.json)
+  python sleeper_sync.py players-sync
+
+  # Roster sync (every 10m/hour) using the S3 players map
+  python sleeper_sync.py roster-sync --username YOUR_USER --season 2025 --league-id <LEAGUE_ID> --out roster.json
+
+EventBridge suggestions
+  - Players sync: 06:05 AM America/Los_Angeles daily
+  - Roster sync:  every 10 minutes
+
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
-from dateutil.parser import isoparse
 
-# ------------------------------
-# Constants & Config
-# ------------------------------
 SLEEPER_BASE = "https://api.sleeper.app/v1"
 DEFAULT_SEASON = datetime.now().year
 PLAYERS_CACHE_PATH = os.getenv("PLAYERS_CACHE_PATH", ".players_nfl.json")
@@ -53,7 +62,7 @@ PLAYERS_CACHE_TTL_HR = int(os.getenv("PLAYERS_CACHE_TTL_HR", "24"))
 # HTTP helpers
 # ------------------------------
 async def fetch_json(client: httpx.AsyncClient, url: str) -> Any:
-    r = await client.get(url, timeout=30)
+    r = await client.get(url, timeout=60)
     r.raise_for_status()
     return r.json()
 
@@ -61,166 +70,212 @@ async def fetch_json(client: httpx.AsyncClient, url: str) -> Any:
 # Sleeper API wrappers
 # ------------------------------
 async def get_user(client: httpx.AsyncClient, username_or_id: str) -> Dict[str, Any]:
-    url = f"{SLEEPER_BASE}/user/{username_or_id}"
-    return await fetch_json(client, url)
+    return await fetch_json(client, f"{SLEEPER_BASE}/user/{username_or_id}")
 
 async def get_user_leagues(client: httpx.AsyncClient, user_id: str, season: int) -> List[Dict[str, Any]]:
-    url = f"{SLEEPER_BASE}/user/{user_id}/leagues/nfl/{season}"
-    return await fetch_json(client, url)
+    return await fetch_json(client, f"{SLEEPER_BASE}/user/{user_id}/leagues/nfl/{season}")
 
 async def get_league_users(client: httpx.AsyncClient, league_id: str) -> List[Dict[str, Any]]:
-    url = f"{SLEEPER_BASE}/league/{league_id}/users"
-    return await fetch_json(client, url)
+    return await fetch_json(client, f"{SLEEPER_BASE}/league/{league_id}/users")
 
 async def get_league_rosters(client: httpx.AsyncClient, league_id: str) -> List[Dict[str, Any]]:
-    url = f"{SLEEPER_BASE}/league/{league_id}/rosters"
-    return await fetch_json(client, url)
+    return await fetch_json(client, f"{SLEEPER_BASE}/league/{league_id}/rosters")
 
-async def get_players_map(client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
-    """Fetch all NFL players. Cache to disk for a short TTL.
-    Returns a dict keyed by Sleeper player_id -> player metadata.
-    """
-    # Try local cache first
+async def fetch_players_from_api(client: httpx.AsyncClient) -> Dict[str, Any]:
+    return await fetch_json(client, f"{SLEEPER_BASE}/players/nfl")
+
+# ------------------------------
+# S3 helpers (optional)
+# ------------------------------
+
+def _boto3():
     try:
-        stat = os.stat(PLAYERS_CACHE_PATH)
-        age_hr = (time.time() - stat.st_mtime) / 3600.0
-        if age_hr <= PLAYERS_CACHE_TTL_HR:
-            with open(PLAYERS_CACHE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+        import boto3  # type: ignore
+        return boto3
+    except Exception as e:
+        print("[warn] boto3 not available; S3 ops disabled:", e, file=sys.stderr)
+        return None
+
+
+def s3_put_json(obj: Any, key: str) -> Optional[str]:
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        return None
+    b3 = _boto3()
+    if not b3:
+        return None
+    s3 = b3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    data = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+def s3_get_json(key: str) -> Optional[Any]:
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        return None
+    b3 = _boto3()
+    if not b3:
+        return None
+    s3 = b3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj["Body"].read()
+        return json.loads(body)
+    except Exception as e:
+        print(f"[warn] s3_get_json failed {bucket}/{key}: {e}", file=sys.stderr)
+        return None
+
+# ------------------------------
+# Players map caching & publishing (decoupled)
+# ------------------------------
+
+def _players_cache_is_fresh(path: str, ttl_hr: int) -> bool:
+    try:
+        age_hr = (time.time() - os.stat(path).st_mtime) / 3600.0
+        return age_hr <= ttl_hr
     except FileNotFoundError:
-        pass
+        return False
 
-    url = f"{SLEEPER_BASE}/players/nfl"
-    players = await fetch_json(client, url)
 
-    # Persist cache
-    with open(PLAYERS_CACHE_PATH, "w", encoding="utf-8") as f:
-        json.dump(players, f)
-    return players
+def _write_local(path: str, obj: Any):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+
+
+def build_players_core(full_map: Dict[str, Any]) -> Dict[str, Any]:
+    core = {}
+    for pid, p in full_map.items():
+        core[pid] = {
+            "full_name": p.get("full_name") or (" ".join(filter(None, [p.get("first_name"), p.get("last_name")]))) or p.get("search_full_name") or p.get("display_name"),
+            "position": p.get("position"),
+            "team": p.get("team"),
+            "bye_week": p.get("bye_week"),
+            "status": p.get("status"),
+            "injury_status": p.get("injury_status"),
+        }
+    return core
+
+
+async def players_sync(publish_to_s3: bool = True, out_local: Optional[str] = None) -> Dict[str, Any]:
+    async with httpx.AsyncClient(headers={"User-Agent": "tyler-ai-gm/0.2"}) as client:
+        full = await fetch_players_from_api(client)
+
+    # Always update local cache
+    _write_local(PLAYERS_CACHE_PATH, full)
+
+    result = {"fetched_at": datetime.now(timezone.utc).isoformat(), "count": len(full)}
+
+    if publish_to_s3 and os.getenv("S3_BUCKET"):
+        prefix = os.getenv("PLAYERS_S3_PREFIX", "sleeper/players")
+        day_key = f"{prefix}/{datetime.now(timezone.utc).date()}.json"
+        cur_key = f"{prefix}/current.json"
+        core_key = f"{prefix}/players_core.json"
+        result["s3_day"] = s3_put_json(full, day_key)
+        result["s3_current"] = s3_put_json(full, cur_key)
+        result["s3_core"] = s3_put_json(build_players_core(full), core_key)
+    else:
+        result["warning"] = "S3_BUCKET not set or publish disabled; wrote local cache only"
+
+    if out_local:
+        _write_local(out_local, full)
+        result["local_out"] = out_local
+
+    return result
 
 # ------------------------------
-# Join & transform
+# Roster sync (reads players from S3 current.json by default)
 # ------------------------------
+
+def _name_from_core(p: Dict[str, Any]) -> Optional[str]:
+    return p.get("full_name")
+
 
 def index_users(users: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {u["user_id"]: u for u in users}
 
-def index_players(players: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return players  # already keyed by id
 
-
-def enrich_rosters(
-    rosters: List[Dict[str, Any]],
-    users_by_id: Dict[str, Dict[str, Any]],
-    players_by_id: Dict[str, Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+def enrich_rosters(rosters: List[Dict[str, Any]], users_by_id: Dict[str, Dict[str, Any]], players_by_id: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     enriched = []
+    def view(pid: str) -> Dict[str, Any]:
+        p = players_by_id.get(pid) or {}
+        return {
+            "player_id": pid,
+            "name": _name_from_core(p),
+            "pos": p.get("position"),
+            "team": p.get("team"),
+            "status": p.get("status"),
+            "injury_status": p.get("injury_status"),
+        }
     for r in rosters:
         owner_id = r.get("owner_id")
         manager = users_by_id.get(owner_id, {}) if owner_id else {}
         roster_players = r.get("players", []) or []
         starters = r.get("starters", []) or []
-
-        def player_view(pid: str) -> Dict[str, Any]:
-            p = players_by_id.get(pid) or {}
-            return {
-                "player_id": pid,
-                "name": name_from_player(p),
-                "pos": p.get("position"),
-                "team": p.get("team"),
-                "status": p.get("status"),
-                "injury_status": p.get("injury_status"),
-            }
-
-        enriched.append(
-            {
-                "league_id": r.get("league_id"),
-                "roster_id": r.get("roster_id"),
-                "manager": {
-                    "user_id": manager.get("user_id"),
-                    "username": manager.get("username"),
-                    "display_name": manager.get("display_name"),
-                    "team_name": (manager.get("metadata") or {}).get("team_name"),
-                },
-                "settings": r.get("settings", {}),
-                "players": [player_view(pid) for pid in roster_players],
-                "starters": [player_view(pid) for pid in starters],
-                "taxi": r.get("taxi") or [],
-                "reserve": r.get("reserve") or [],
-            }
-        )
+        enriched.append({
+            "league_id": r.get("league_id"),
+            "roster_id": r.get("roster_id"),
+            "manager": {
+                "user_id": manager.get("user_id"),
+                "username": manager.get("username"),
+                "display_name": manager.get("display_name"),
+                "team_name": (manager.get("metadata") or {}).get("team_name"),
+            },
+            "settings": r.get("settings", {}),
+            "players": [view(pid) for pid in roster_players],
+            "starters": [view(pid) for pid in starters],
+            "taxi": r.get("taxi") or [],
+            "reserve": r.get("reserve") or [],
+        })
     return enriched
 
 
-def name_from_player(p: Dict[str, Any]) -> Optional[str]:
-    if not p:
-        return None
-    # Sleeper commonly provides full_name or first_name/last_name
-    full = p.get("full_name")
-    if full:
-        return full
-    first, last = p.get("first_name"), p.get("last_name")
-    if first or last:
-        return " ".join([x for x in [first, last] if x])
-    return p.get("search_full_name") or p.get("display_name")
-
-# ------------------------------
-# Persistence (optional)
-# ------------------------------
-
-def maybe_write_s3(obj: Any, league_id: str) -> Optional[str]:
-    bucket = os.getenv("S3_BUCKET")
-    if not bucket:
-        return None
-    try:
-        import boto3  # type: ignore
-
-        s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
-        key = f"sleeper_sync/{league_id}.json"
-        data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-        s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/json")
-        return f"s3://{bucket}/{key}"
-    except Exception as e:  # pragma: no cover
-        print(f"[warn] failed to write to S3: {e}", file=sys.stderr)
-        return None
-
-# ------------------------------
-# Orchestration
-# ------------------------------
-import asyncio
-
-async def sync_league(username: str, season: int, league_id: Optional[str] = None) -> Dict[str, Any]:
-    async with httpx.AsyncClient(headers={"User-Agent": "tyler-ai-gm/0.1"}) as client:
+async def roster_sync(username: str, season: int, league_id: Optional[str]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(headers={"User-Agent": "tyler-ai-gm/0.2"}) as client:
         user = await get_user(client, username)
         user_id = user.get("user_id")
         if not user_id:
-            raise RuntimeError(f"No user_id found for '{username}'")
-
+            raise RuntimeError(f"No user_id for '{username}'")
         leagues = await get_user_leagues(client, user_id, season)
         if not leagues:
-            raise RuntimeError(f"No leagues for user {username} in season {season}")
+            raise RuntimeError(f"No leagues for user {username} in {season}")
 
-        # Choose league
-        target_league = None
+        # Pick league
+        target = None
         if league_id:
-            target_league = next((l for l in leagues if l.get("league_id") == league_id), None)
-            if not target_league:
+            target = next((l for l in leagues if l.get("league_id") == league_id), None)
+            if not target:
                 raise RuntimeError(f"league_id {league_id} not found for user {username}")
         else:
-            # Heuristic: pick the first in-season league, else first
-            target_league = next((l for l in leagues if l.get("status") in {"drafting", "in_season"}), leagues[0])
+            target = next((l for l in leagues if l.get("status") in {"drafting", "in_season"}), leagues[0])
 
-        league_id = target_league.get("league_id")
-        league_name = target_league.get("name")
+        league_id = target.get("league_id")
 
-        users, rosters, players_map = await asyncio.gather(
+        # Prefer S3 players current.json if configured
+        players_core = None
+        if os.getenv("USE_S3_PLAYERS") and os.getenv("S3_BUCKET"):
+            prefix = os.getenv("PLAYERS_S3_PREFIX", "sleeper/players")
+            players_core = s3_get_json(f"{prefix}/players_core.json") or s3_get_json(f"{prefix}/current.json")
+            if players_core and isinstance(players_core, dict) and "full_name" not in next(iter(players_core.values()), {}):
+                # current.json may be full map; convert to core structure
+                players_core = build_players_core(players_core)
+
+        # Fallback to local cache or live fetch (keeps roster sync resilient)
+        if players_core is None:
+            # try local cache
+            if _players_cache_is_fresh(PLAYERS_CACHE_PATH, PLAYERS_CACHE_TTL_HR):
+                with open(PLAYERS_CACHE_PATH, "r", encoding="utf-8") as f:
+                    players_core = build_players_core(json.load(f))
+            else:
+                # live fetch as last resort (still decoupled in practice if S3 is set)
+                players_core = build_players_core(await fetch_players_from_api(client))
+
+        users, rosters = await asyncio.gather(
             get_league_users(client, league_id),
             get_league_rosters(client, league_id),
-            get_players_map(client),
         )
         users_by_id = index_users(users)
-        players_by_id = index_players(players_map)
-        enriched = enrich_rosters(rosters, users_by_id, players_by_id)
+        teams = enrich_rosters(rosters, users_by_id, players_core)
 
         snapshot = {
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -228,56 +283,78 @@ async def sync_league(username: str, season: int, league_id: Optional[str] = Non
             "season": season,
             "league": {
                 "league_id": league_id,
-                "name": league_name,
-                "status": target_league.get("status"),
-                "scoring_settings": target_league.get("scoring_settings"),
-                "roster_positions": target_league.get("roster_positions"),
+                "name": target.get("name"),
+                "status": target.get("status"),
+                "scoring_settings": target.get("scoring_settings"),
+                "roster_positions": target.get("roster_positions"),
             },
-            "teams": enriched,
+            "teams": teams,
         }
 
         # Optional write to S3
-        s3_uri = maybe_write_s3(snapshot, league_id)
-        if s3_uri:
-            snapshot["s3_uri"] = s3_uri
+        bucket = os.getenv("S3_BUCKET")
+        if bucket:
+            key = f"{os.getenv('ROSTER_S3_PREFIX', 'sleeper_sync')}/{league_id}.json"
+            snapshot["s3_uri"] = s3_put_json(snapshot, key)
         return snapshot
 
 # ------------------------------
 # CLI
 # ------------------------------
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Sync a Sleeper league's rosters to JSON")
-    parser.add_argument("--username", required=True, help="Sleeper username (not display name)")
-    parser.add_argument("--season", type=int, default=DEFAULT_SEASON, help="Season year, e.g., 2025")
-    parser.add_argument("--league-id", help="Specific league_id to sync (optional)")
-    parser.add_argument("--out", help="Write JSON to this local file as well (optional)")
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Sleeper decoupled syncs")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_players = sub.add_parser("players-sync", help="Fetch players map and publish to S3/local")
+    p_players.add_argument("--out", help="Write full players map to local file as well")
+
+    p_roster = sub.add_parser("roster-sync", help="Fetch a league's rosters")
+    p_roster.add_argument("--username", required=True)
+    p_roster.add_argument("--season", type=int, default=DEFAULT_SEASON)
+    p_roster.add_argument("--league-id")
+    p_roster.add_argument("--out", help="Write roster snapshot to local file")
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = make_parser()
     args = parser.parse_args(argv)
 
-    snapshot = asyncio.run(sync_league(args.username, args.season, args.league_id))
+    if args.cmd == "players-sync":
+        res = asyncio.run(players_sync(publish_to_s3=True, out_local=getattr(args, "out", None)))
+        print(json.dumps(res, indent=2))
+        return 0
 
-    text = json.dumps(snapshot, indent=2, ensure_ascii=False)
-    print(text)
+    if args.cmd == "roster-sync":
+        snap = asyncio.run(roster_sync(args.username, args.season, getattr(args, "league_id", None)))
+        text = json.dumps(snap, indent=2, ensure_ascii=False)
+        print(text)
+        if getattr(args, "out", None):
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"[ok] wrote {args.out}")
+        return 0
 
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(text)
-        print(f"[ok] wrote {args.out}")
-
-    return 0
+    parser.error("unknown command")
+    return 2
 
 # ------------------------------
-# Lambda handler
+# Lambda handlers (decoupled)
 # ------------------------------
 
-def lambda_handler(event, context):  # pragma: no cover
+def players_lambda_handler(event, context):  # pragma: no cover
+    res = asyncio.run(players_sync(publish_to_s3=True, out_local=event.get("out")))
+    return {"statusCode": 200, "body": json.dumps(res)}
+
+
+def roster_lambda_handler(event, context):  # pragma: no cover
     username = event.get("username")
     season = int(event.get("season", DEFAULT_SEASON))
     league_id = event.get("league_id")
-    snap = asyncio.run(sync_league(username, season, league_id))
+    snap = asyncio.run(roster_sync(username, season, league_id))
     return {"statusCode": 200, "body": json.dumps(snap)}
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
